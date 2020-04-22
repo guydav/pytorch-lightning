@@ -285,12 +285,13 @@ class TrainerDDPMixin(ABC):
         :param cluster_obj:
         :return:
         """
-        # node rank using relative slurm id
-        # otherwise default to node rank 0
+        # node rank using relative slurm id if under slurm management
+        # otherwise use given node rank or default to node rank 0
         try:
-            node_id = os.environ['SLURM_NODEID']
+            node_id = os.environ['SLURM_NODEID'] if self.is_slurm_managing_tasks else os.environ['NODE_RANK']
             self.node_rank = int(node_id)
-        except Exception:
+        except KeyError:
+            log.warning("SLURM_NODEID or NODE_RANK environment variable is not defined. Set as 0.")
             self.node_rank = 0
 
         # show progressbar only on progress_rank 0
@@ -317,7 +318,7 @@ class TrainerDDPMixin(ABC):
         # try to init for 20 times at max in case ports are taken
         # where to store ip_table
         model.trainer = self
-        model.init_ddp_connection(self.proc_rank, self.world_size)
+        model.init_ddp_connection(self.proc_rank, self.world_size, self.is_slurm_managing_tasks)
 
         # CHOOSE OPTIMIZER
         # allow for lr schedulers as well
@@ -326,7 +327,7 @@ class TrainerDDPMixin(ABC):
         # MODEL
         # copy model to each gpu
         if self.on_gpu:
-            self.root_gpu = self.data_parallel_device_ids[process_idx]
+            self.root_gpu = process_idx
             torch.cuda.set_device(self.root_gpu)
             model.cuda(self.root_gpu)
 
