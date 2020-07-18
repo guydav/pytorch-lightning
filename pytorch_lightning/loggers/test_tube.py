@@ -7,11 +7,13 @@ from typing import Optional, Dict, Any, Union
 
 try:
     from test_tube import Experiment
+    _TEST_TUBE_AVAILABLE = True
 except ImportError:  # pragma: no-cover
-    raise ImportError('You want to use `test_tube` logger which is not installed yet,'  # pragma: no-cover
-                      ' install it with `pip install test-tube`.')
+    Experiment = None
+    _TEST_TUBE_AVAILABLE = False
 
-from pytorch_lightning.loggers.base import LightningLoggerBase, rank_zero_only
+from pytorch_lightning.loggers.base import LightningLoggerBase, rank_zero_experiment
+from pytorch_lightning.utilities.distributed import rank_zero_only
 
 
 class TestTubeLogger(LightningLoggerBase):
@@ -61,8 +63,12 @@ class TestTubeLogger(LightningLoggerBase):
                  debug: bool = False,
                  version: Optional[int] = None,
                  create_git_tag: bool = False):
+
+        if not _TEST_TUBE_AVAILABLE:
+            raise ImportError('You want to use `test_tube` logger which is not installed yet,'
+                              ' install it with `pip install test-tube`.')
         super().__init__()
-        self.save_dir = save_dir
+        self._save_dir = save_dir
         self._name = name
         self.description = description
         self.debug = debug
@@ -71,6 +77,7 @@ class TestTubeLogger(LightningLoggerBase):
         self._experiment = None
 
     @property
+    @rank_zero_experiment
     def experiment(self) -> Experiment:
         r"""
 
@@ -92,7 +99,7 @@ class TestTubeLogger(LightningLoggerBase):
             version=self.version,
             description=self.description,
             create_git_tag=self.create_git_tag,
-            rank=self.rank,
+            rank=rank_zero_only.rank,
         )
         return self._experiment
 
@@ -135,14 +142,8 @@ class TestTubeLogger(LightningLoggerBase):
             exp.close()
 
     @property
-    def rank(self) -> int:
-        return self._rank
-
-    @rank.setter
-    def rank(self, value: int) -> None:
-        self._rank = value
-        if self._experiment is not None:
-            self.experiment.rank = value
+    def save_dir(self) -> Optional[str]:
+        return self._save_dir
 
     @property
     def name(self) -> str:

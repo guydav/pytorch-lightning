@@ -1,14 +1,12 @@
 from collections import OrderedDict
-from typing import Dict
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import optim
 from torch.utils.data import DataLoader
 
-from tests.base.datasets import TrialMNIST
+from tests.base.datasets import TrialMNIST, AverageDataset, MNIST
 
 try:
     from test_tube import HyperOptArgumentParser
@@ -19,144 +17,8 @@ except ImportError:
 from pytorch_lightning.core.lightning import LightningModule
 
 
-class DictHparamsModel(LightningModule):
-
-    def __init__(self, hparams: Dict):
-        super().__init__()
-        self.hparams = hparams
-        self.l1 = torch.nn.Linear(hparams.get('in_features'), hparams['out_features'])
-
-    def forward(self, x):
-        return torch.relu(self.l1(x.view(x.size(0), -1)))
-
-    def training_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
-        return {'loss': F.cross_entropy(y_hat, y)}
-
-    def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=0.02)
-
-    def train_dataloader(self):
-        return DataLoader(TrialMNIST(train=True, download=True), batch_size=16)
-
-
-class TestModelBase(LightningModule):
-    """Base LightningModule for testing. Implements only the required interface."""
-
-    def __init__(self, hparams, force_remove_distributed_sampler: bool = False):
-        """Pass in parsed HyperOptArgumentParser to the model."""
-        # init superclass
-        super().__init__()
-        self.hparams = hparams
-
-        self.batch_size = hparams.batch_size
-
-        # if you specify an example input, the summary will show input/output for each layer
-        self.example_input_array = torch.rand(5, 28 * 28)
-
-        # remove to test warning for dist sampler
-        self.force_remove_distributed_sampler = force_remove_distributed_sampler
-
-        # build model
-        self.__build_model()
-
-    # ---------------------
-    # MODEL SETUP
-    # ---------------------
-    def __build_model(self):
-        """Layout model."""
-        self.c_d1 = nn.Linear(in_features=self.hparams.in_features,
-                              out_features=self.hparams.hidden_dim)
-        self.c_d1_bn = nn.BatchNorm1d(self.hparams.hidden_dim)
-        self.c_d1_drop = nn.Dropout(self.hparams.drop_prob)
-
-        self.c_d2 = nn.Linear(in_features=self.hparams.hidden_dim,
-                              out_features=self.hparams.out_features)
-
-    # ---------------------
-    # TRAINING
-    # ---------------------
-    def forward(self, x):
-        """No special modification required for lightning, define as you normally would."""
-        x = self.c_d1(x)
-        x = torch.tanh(x)
-        x = self.c_d1_bn(x)
-        x = self.c_d1_drop(x)
-
-        x = self.c_d2(x)
-        logits = F.log_softmax(x, dim=1)
-
-        return logits
-
-    def loss(self, labels, logits):
-        nll = F.nll_loss(logits, labels)
-        return nll
-
-    def training_step(self, batch, batch_idx, optimizer_idx=None):
-        """Lightning calls this inside the training loop"""
-        # forward pass
-        x, y = batch
-        x = x.view(x.size(0), -1)
-
-        y_hat = self(x)
-
-        # calculate loss
-        loss_val = self.loss(y, y_hat)
-
-        # in DP mode (default) make sure if result is scalar, there's another dim in the beginning
-        if self.trainer.use_dp:
-            loss_val = loss_val.unsqueeze(0)
-
-        # alternate possible outputs to test
-        if self.trainer.batch_idx % 1 == 0:
-            output = OrderedDict({
-                'loss': loss_val,
-                'progress_bar': {'some_val': loss_val * loss_val},
-                'log': {'train_some_val': loss_val * loss_val},
-            })
-
-            return output
-        if self.trainer.batch_idx % 2 == 0:
-            return loss_val
-
-    # ---------------------
-    # TRAINING SETUP
-    # ---------------------
-    def configure_optimizers(self):
-        """
-        return whatever optimizers we want here.
-        :return: list of optimizers
-        """
-        # try no scheduler for this model (testing purposes)
-        if self.hparams.optimizer_name == 'lbfgs':
-            optimizer = optim.LBFGS(self.parameters(), lr=self.hparams.learning_rate)
-        else:
-            optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
-        return [optimizer], [scheduler]
-
-    def prepare_data(self):
-        _ = TrialMNIST(root=self.hparams.data_root, train=True, download=True)
-
-    def _dataloader(self, train):
-        # init data generators
-        dataset = TrialMNIST(root=self.hparams.data_root, train=train, download=True)
-
-        # when using multi-node we need to add the datasampler
-        batch_size = self.hparams.batch_size
-
-        loader = DataLoader(
-            dataset=dataset,
-            batch_size=batch_size,
-            shuffle=True
-        )
-
-        return loader
-
-
 class Generator(nn.Module):
-    def __init__(self, latent_dim, img_shape):
+    def __init__(self, latent_dim: tuple, img_shape: tuple):
         super().__init__()
         self.img_shape = img_shape
 
@@ -183,7 +45,7 @@ class Generator(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, img_shape):
+    def __init__(self, img_shape: tuple):
         super().__init__()
 
         self.model = nn.Sequential(
@@ -205,18 +67,23 @@ class Discriminator(nn.Module):
 class TestGAN(LightningModule):
     """Implements a basic GAN for the purpose of illustrating multiple optimizers."""
 
-    def __init__(self, hparams):
+    def __init__(self, hidden_dim, learning_rate, b1, b2, **kwargs):
         super().__init__()
-        self.hparams = hparams
+        self.hidden_dim = hidden_dim
+        self.learning_rate = learning_rate
+        self.b1 = b1
+        self.b2 = b2
 
         # networks
         mnist_shape = (1, 28, 28)
-        self.generator = Generator(latent_dim=hparams.hidden_dim, img_shape=mnist_shape)
+        self.generator = Generator(latent_dim=self.hidden_dim, img_shape=mnist_shape)
         self.discriminator = Discriminator(img_shape=mnist_shape)
 
         # cache for generated images
         self.generated_imgs = None
         self.last_imgs = None
+
+        self.example_input_array = torch.rand(2, self.hidden_dim)
 
     def forward(self, z):
         return self.generator(z)
@@ -231,7 +98,7 @@ class TestGAN(LightningModule):
         # train generator
         if optimizer_idx == 0:
             # sample noise
-            z = torch.randn(imgs.shape[0], self.hparams.hidden_dim)
+            z = torch.randn(imgs.shape[0], self.hidden_dim)
             z = z.type_as(imgs)
 
             # generate images
@@ -266,8 +133,7 @@ class TestGAN(LightningModule):
             fake = torch.zeros(imgs.size(0), 1)
             fake = fake.type_as(fake)
 
-            fake_loss = self.adversarial_loss(
-                self.discriminator(self.generated_imgs.detach()), fake)
+            fake_loss = self.adversarial_loss(self.discriminator(self.generated_imgs.detach()), fake)
 
             # discriminator loss is the average of these
             d_loss = (real_loss + fake_loss) / 2
@@ -280,9 +146,9 @@ class TestGAN(LightningModule):
             return output
 
     def configure_optimizers(self):
-        lr = self.hparams.learning_rate
-        b1 = self.hparams.b1
-        b2 = self.hparams.b2
+        lr = self.learning_rate
+        b1 = self.b1
+        b2 = self.b2
 
         opt_g = torch.optim.Adam(self.generator.parameters(), lr=lr, betas=(b1, b2))
         opt_d = torch.optim.Adam(self.discriminator.parameters(), lr=lr, betas=(b1, b2))
@@ -290,3 +156,58 @@ class TestGAN(LightningModule):
 
     def train_dataloader(self):
         return DataLoader(TrialMNIST(train=True, download=True), batch_size=16)
+
+
+class ParityModuleRNN(LightningModule):
+    def __init__(self):
+        super().__init__()
+        self.rnn = nn.LSTM(10, 20, batch_first=True)
+        self.linear_out = nn.Linear(in_features=20, out_features=5)
+
+    def forward(self, x):
+        seq, last = self.rnn(x)
+        return self.linear_out(seq)
+
+    def training_step(self, batch, batch_nb):
+        x, y = batch
+        y_hat = self(x)
+        loss = F.mse_loss(y_hat, y)
+        return {'loss': loss}
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=0.02)
+
+    def train_dataloader(self):
+        return DataLoader(AverageDataset(), batch_size=30)
+
+
+class ParityModuleMNIST(LightningModule):
+
+    def __init__(self):
+        super().__init__()
+        self.c_d1 = nn.Linear(in_features=28 * 28, out_features=128)
+        self.c_d1_bn = nn.BatchNorm1d(128)
+        self.c_d1_drop = nn.Dropout(0.3)
+        self.c_d2 = nn.Linear(in_features=128, out_features=10)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = self.c_d1(x)
+        x = torch.tanh(x)
+        x = self.c_d1_bn(x)
+        x = self.c_d1_drop(x)
+        x = self.c_d2(x)
+        return x
+
+    def training_step(self, batch, batch_nb):
+        x, y = batch
+        y_hat = self(x)
+        loss = F.cross_entropy(y_hat, y)
+        return {'loss': loss}
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=0.02)
+
+    def train_dataloader(self):
+        return DataLoader(MNIST(train=True, download=True,),
+                          batch_size=128)

@@ -3,83 +3,131 @@ import os
 import pytest
 import torch
 
-import tests.base.utils as tutils
+import tests.base.develop_pipelines as tpipes
+import tests.base.develop_utils as tutils
 from pytorch_lightning import Trainer
 from pytorch_lightning.utilities.exceptions import MisconfigurationException
-from tests.base import (
-    LightningTestModel,
-)
+from tests.base import EvalModelTemplate
+import wandb
+from unittest.mock import MagicMock
 
 
-@pytest.mark.spawn
-@pytest.mark.parametrize("backend", ['dp', 'ddp'])
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="test requires GPU machine")
-def test_amp_single_gpu(tmpdir, backend):
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="test requires multi-GPU machine")
+def test_multi_gpu_wandb_ddp_spawn(tmpdir):
     """Make sure DP/DDP + AMP work."""
-    tutils.reset_seed()
+    from pytorch_lightning.loggers import WandbLogger
+    tutils.set_random_master_port()
 
-    model, hparams = tutils.get_default_model()
+    model = EvalModelTemplate()
 
+    wandb.run = MagicMock()
+    wandb.init(name='name', project='project')
+
+    logger = WandbLogger(name='name', offline=True)
     trainer_options = dict(
         default_root_dir=tmpdir,
         max_epochs=1,
+        gpus=2,
+        distributed_backend='ddp_spawn',
+        precision=16,
+        logger=logger,
+
+    )
+    # tutils.run_model_test(trainer_options, model)
+    trainer = Trainer(**trainer_options)
+    result = trainer.fit(model)
+    assert result
+    trainer.test(model)
+
+
+@pytest.mark.skip(reason='dp + amp not supported currently')  # TODO
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="test requires GPU machine")
+def test_amp_single_gpu_dp(tmpdir):
+    """Make sure DP/DDP + AMP work."""
+    tutils.reset_seed()
+
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        max_epochs=1,
         gpus=1,
-        distributed_backend=backend,
-        precision=16
+        distributed_backend='dp',
+        precision=16,
     )
 
+    model = EvalModelTemplate()
     # tutils.run_model_test(trainer_options, model)
-
-    trainer = Trainer(**trainer_options)
     result = trainer.fit(model)
 
     assert result == 1
 
 
-@pytest.mark.spawn
-@pytest.mark.parametrize("backend", ['dp', 'ddp'])
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="test requires multi-GPU machine")
-def test_amp_multi_gpu(tmpdir, backend):
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="test requires GPU machine")
+def test_amp_single_gpu_ddp_spawn(tmpdir):
     """Make sure DP/DDP + AMP work."""
     tutils.reset_seed()
-    tutils.set_random_master_port()
-
-    model, hparams = tutils.get_default_model()
-
-    trainer_options = dict(
+    trainer = Trainer(
         default_root_dir=tmpdir,
         max_epochs=1,
-        # gpus=2,
-        gpus='0, 1',  # test init with gpu string
-        distributed_backend=backend,
-        precision=16
+        gpus=1,
+        distributed_backend='ddp_spawn',
+        precision=16,
     )
 
+    model = EvalModelTemplate()
     # tutils.run_model_test(trainer_options, model)
-    trainer = Trainer(**trainer_options)
     result = trainer.fit(model)
-    assert result
+
+    assert result == 1
 
 
-@pytest.mark.spawn
+@pytest.mark.skip(reason='dp + amp not supported currently')  # TODO
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="test requires GPU machine")
+def test_amp_multi_gpu_dp(tmpdir):
+    """Make sure DP/DDP + AMP work."""
+    tutils.reset_seed()
+
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        max_epochs=1,
+        gpus=2,
+        distributed_backend='dp',
+        precision=16,
+    )
+
+    model = EvalModelTemplate()
+    # tutils.run_model_test(trainer_options, model)
+    result = trainer.fit(model)
+
+    assert result == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="test requires GPU machine")
+def test_amp_multi_gpu_ddp_spawn(tmpdir):
+    """Make sure DP/DDP + AMP work."""
+    tutils.reset_seed()
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        max_epochs=1,
+        gpus=2,
+        distributed_backend='ddp_spawn',
+        precision=16,
+    )
+
+    model = EvalModelTemplate()
+    # tutils.run_model_test(trainer_options, model)
+    result = trainer.fit(model)
+
+    assert result == 1
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="test requires multi-GPU machine")
 def test_amp_gpu_ddp_slurm_managed(tmpdir):
     """Make sure DDP + AMP work."""
-    tutils.reset_seed()
-
     # simulate setting slurm flags
     tutils.set_random_master_port()
     os.environ['SLURM_LOCALID'] = str(0)
 
-    hparams = tutils.get_default_hparams()
-    model = LightningTestModel(hparams)
-
-    trainer_options = dict(
-        max_epochs=1,
-        gpus=[0],
-        distributed_backend='ddp',
-        precision=16
-    )
+    model = EvalModelTemplate()
 
     # exp file to get meta
     logger = tutils.get_default_logger(tmpdir)
@@ -87,12 +135,16 @@ def test_amp_gpu_ddp_slurm_managed(tmpdir):
     # exp file to get weights
     checkpoint = tutils.init_checkpoint_callback(logger)
 
-    # add these to the trainer options
-    trainer_options['checkpoint_callback'] = checkpoint
-    trainer_options['logger'] = logger
-
     # fit model
-    trainer = Trainer(**trainer_options)
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        max_epochs=1,
+        gpus=[0],
+        distributed_backend='ddp_spawn',
+        precision=16,
+        checkpoint_callback=checkpoint,
+        logger=logger,
+    )
     trainer.is_slurm_managing_tasks = True
     result = trainer.fit(model)
 
@@ -108,18 +160,16 @@ def test_amp_gpu_ddp_slurm_managed(tmpdir):
 
 def test_cpu_model_with_amp(tmpdir):
     """Make sure model trains on CPU."""
-    tutils.reset_seed()
-
     trainer_options = dict(
         default_root_dir=tmpdir,
         progress_bar_refresh_rate=0,
         max_epochs=1,
-        train_percent_check=0.4,
-        val_percent_check=0.4,
+        limit_train_batches=0.4,
+        limit_val_batches=0.4,
         precision=16
     )
 
-    model, hparams = tutils.get_default_model()
+    model = EvalModelTemplate()
 
     with pytest.raises((MisconfigurationException, ModuleNotFoundError)):
-        tutils.run_model_test(trainer_options, model, on_gpu=False)
+        tpipes.run_model_test(trainer_options, model, on_gpu=False)

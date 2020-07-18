@@ -3,7 +3,6 @@ TensorBoard
 -----------
 """
 
-import csv
 import os
 from argparse import Namespace
 from typing import Optional, Dict, Union, Any
@@ -13,8 +12,10 @@ import torch
 from pkg_resources import parse_version
 from torch.utils.tensorboard import SummaryWriter
 
-from pytorch_lightning.loggers.base import LightningLoggerBase, rank_zero_only
 from pytorch_lightning import _logger as log
+from pytorch_lightning.core.saving import save_hparams_to_yaml
+from pytorch_lightning.loggers.base import LightningLoggerBase, rank_zero_experiment
+from pytorch_lightning.utilities import rank_zero_only
 
 
 class TensorBoardLogger(LightningLoggerBase):
@@ -41,7 +42,7 @@ class TensorBoardLogger(LightningLoggerBase):
         \**kwargs: Other arguments are passed directly to the :class:`SummaryWriter` constructor.
 
     """
-    NAME_CSV_TAGS = 'meta_tags.csv'
+    NAME_HPARAMS_FILE = 'hparams.yaml'
 
     def __init__(self,
                  save_dir: str,
@@ -49,12 +50,12 @@ class TensorBoardLogger(LightningLoggerBase):
                  version: Optional[Union[int, str]] = None,
                  **kwargs):
         super().__init__()
-        self.save_dir = save_dir
-        self._name = name
+        self._save_dir = save_dir
+        self._name = name or ''
         self._version = version
 
         self._experiment = None
-        self.tags = {}
+        self.hparams = {}
         self._kwargs = kwargs
 
     @property
@@ -82,6 +83,11 @@ class TensorBoardLogger(LightningLoggerBase):
         return log_dir
 
     @property
+    def save_dir(self) -> Optional[str]:
+        return self._save_dir
+
+    @property
+    @rank_zero_experiment
     def experiment(self) -> SummaryWriter:
         r"""
         Actual tensorboard object. To use TensorBoard features in your
@@ -95,15 +101,22 @@ class TensorBoardLogger(LightningLoggerBase):
         if self._experiment is not None:
             return self._experiment
 
+        assert rank_zero_only.rank == 0, 'tried to init log dirs in non global_rank=0'
         os.makedirs(self.root_dir, exist_ok=True)
         self._experiment = SummaryWriter(log_dir=self.log_dir, **self._kwargs)
         return self._experiment
 
     @rank_zero_only
-    def log_hyperparams(self, params: Union[Dict[str, Any], Namespace]) -> None:
+    def log_hyperparams(self, params: Union[Dict[str, Any], Namespace],
+                        metrics: Optional[Dict[str, Any]] = None) -> None:
         params = self._convert_params(params)
+
+        # store params to output
+        self.hparams.update(params)
+
+        # format params into the suitable for tensorboard
         params = self._flatten_dict(params)
-        sanitized_params = self._sanitize_params(params)
+        params = self._sanitize_params(params)
 
         if parse_version(torch.__version__) < parse_version("1.3.0"):
             warn(
@@ -113,17 +126,23 @@ class TensorBoardLogger(LightningLoggerBase):
             )
         else:
             from torch.utils.tensorboard.summary import hparams
-            exp, ssi, sei = hparams(sanitized_params, {})
+
+            if metrics is None:
+                metrics = {}
+            exp, ssi, sei = hparams(params, metrics)
             writer = self.experiment._get_file_writer()
             writer.add_summary(exp)
             writer.add_summary(ssi)
             writer.add_summary(sei)
 
-        # some alternative should be added
-        self.tags.update(sanitized_params)
+            if metrics:
+                # necessary for hparam comparison with metrics
+                self.log_metrics(metrics)
 
     @rank_zero_only
     def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None) -> None:
+        assert rank_zero_only.rank == 0, 'experiment tried to log from global_rank != 0'
+
         for k, v in metrics.items():
             if isinstance(v, torch.Tensor):
                 v = v.item()
@@ -132,26 +151,15 @@ class TensorBoardLogger(LightningLoggerBase):
     @rank_zero_only
     def save(self) -> None:
         super().save()
-        try:
-            self.experiment.flush()
-        except AttributeError:
-            # you are using PT version (<v1.2) which does not have implemented flush
-            self.experiment._get_file_writer().flush()
-
         dir_path = self.log_dir
         if not os.path.isdir(dir_path):
             dir_path = self.save_dir
 
         # prepare the file path
-        meta_tags_path = os.path.join(dir_path, self.NAME_CSV_TAGS)
+        hparams_file = os.path.join(dir_path, self.NAME_HPARAMS_FILE)
 
         # save the metatags file
-        with open(meta_tags_path, 'w', newline='') as csvfile:
-            fieldnames = ['key', 'value']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writerow({'key': 'key', 'value': 'value'})
-            for k, v in self.tags.items():
-                writer.writerow({'key': k, 'value': v})
+        save_hparams_to_yaml(hparams_file, self.hparams)
 
     @rank_zero_only
     def finalize(self, status: str) -> None:
@@ -183,3 +191,8 @@ class TensorBoardLogger(LightningLoggerBase):
             return 0
 
         return max(existing_versions) + 1
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_experiment"] = None
+        return state

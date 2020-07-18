@@ -14,12 +14,36 @@ class Callback(abc.ABC):
     Abstract base class used to build new callbacks.
     """
 
+    def setup(self, trainer, stage: str):
+        """Called when fit or test begins"""
+        pass
+
+    def teardown(self, trainer, stage: str):
+        """Called when fit or test ends"""
+        pass
+
     def on_init_start(self, trainer):
         """Called when the trainer initialization begins, model has not yet been set."""
         pass
 
     def on_init_end(self, trainer):
         """Called when the trainer initialization ends, model has not yet been set."""
+        pass
+
+    def on_fit_start(self, trainer):
+        """Called when fit begins"""
+        pass
+
+    def on_fit_end(self, trainer):
+        """Called when fit ends"""
+        pass
+
+    def on_sanity_check_start(self, trainer, pl_module):
+        """Called when the validation sanity check starts."""
+        pass
+
+    def on_sanity_check_end(self, trainer, pl_module):
+        """Called when the validation sanity check ends."""
         pass
 
     def on_epoch_start(self, trainer, pl_module):
@@ -32,6 +56,22 @@ class Callback(abc.ABC):
 
     def on_batch_start(self, trainer, pl_module):
         """Called when the training batch begins."""
+        pass
+
+    def on_validation_batch_start(self, trainer, pl_module):
+        """Called when the validation batch begins."""
+        pass
+
+    def on_validation_batch_end(self, trainer, pl_module):
+        """Called when the validation batch ends."""
+        pass
+
+    def on_test_batch_start(self, trainer, pl_module):
+        """Called when the test batch begins."""
+        pass
+
+    def on_test_batch_end(self, trainer, pl_module):
+        """Called when the test batch ends."""
         pass
 
     def on_batch_end(self, trainer, pl_module):
@@ -61,3 +101,6 @@ class Callback(abc.ABC):
     def on_test_end(self, trainer, pl_module):
         """Called when the test ends."""
         pass
+
+    def on_keyboard_interrupt(self, trainer, pl_module):
+        """Called when the training is interrupted by KeyboardInterrupt."""

@@ -11,69 +11,35 @@ references:
       name: Install Dependences
       command: |
         sudo apt-get update && sudo apt-get install -y cmake
-        pip install "$TORCH_VERSION"
-        pip install -r requirements.txt -q
-        sudo pip install pytest pytest-cov pytest-flake8 -q
-        pip install -r ./tests/requirements-devel.txt -q
+        pip install -r requirements/base.txt -q
+        pip install -r requirements/test.txt -q
 
   tests: &tests
    run:
      name: Testing
      command: |
        python --version ; pip --version ; pip list
-       py.test pytorch_lightning tests -v --doctest-modules --junitxml=test-reports/pytest_junit.xml
-     no_output_timeout: 30m
-
-  examples: &examples
-   run:
-     name: PL Examples
-     command: |
-       pip install -r ./pl_examples/requirements.txt --user
-       python --version ; pip --version ; pip list
-       py.test pl_examples -v --doctest-modules --junitxml=test-reports/pytest_junit.xml
-     no_output_timeout: 20m
-
-  install_pkg: &install_pkg
-    run:
-      name: Install package
-      command: |
-        virtualenv vEnv ; source vEnv/bin/activate
-        pip install --editable . ; cd .. & python -c "import pytorch_lightning ; print(pytorch_lightning.__version__)"
-        deactivate ; rm -rf vEnv
-
-  create_pkg: &create_pkg
-    run:
-      name: Create package
-      command: |
-        sudo pip install twine==1.13.0
-        python setup.py sdist
-        twine check dist/*
-        python setup.py clean
-
-  format: &format
-   run:
-     name: Formatting
-     command: |
-       python --version ; pip --version
-       sudo pip install flake8 -q
-       pip list
-       flake8 .
+       python -m pytest pytorch_lightning -v --junitxml=test-reports/pytest_junit.xml  --ignore=pytorch_lightning/loggers/comet.py --ignore=pytorch_lightning/loggers/mlflow.py --ignore=pytorch_lightning/loggers/neptune.py --ignore=pytorch_lightning/loggers/test_tube.py --ignore=pytorch_lightning/loggers/wandb.py --ignore=pytorch_lightning/metrics/sklearns.py
+     no_output_timeout: 15m
 
   make_docs: &make_docs
    run:
      name: Make Documentation
      command: |
-       # sudo apt-get install pandoc
-       pip install -r requirements.txt --user
-       sudo pip install -r docs/requirements.txt
-       # sphinx-apidoc -o ./docs/source ./pytorch_lightning **/test_* --force --follow-links
-       cd docs; make clean ; make html --debug --jobs 2 SPHINXOPTS="-W"
+       # First run the same pipeline as Read-The-Docs
+       # apt-get update && apt-get install -y cmake
+       # using: https://hub.docker.com/r/readthedocs/build
+       # we need to use py3.7 ot higher becase of an issue with metaclass inheritence
+       pyenv global 3.7.3
+       python --version
+       pip install -r requirements/docs.txt
+       cd docs; make clean; make html --debug --jobs 2 SPHINXOPTS="-W"
 
 jobs:
 
   Build-Docs:
     docker:
-      - image: circleci/python:3.7
+      - image: readthedocs/build:latest
     steps:
       - checkout
       - *make_docs
@@ -82,107 +48,24 @@ jobs:
           path: docs/build/html/
           destination: html
 
-  Formatting:
-    docker:
-      - image: circleci/python:3.7
-    environment:
-        - TORCH_VERSION: "torch"
-    steps:
-      - checkout
-      - *format
-
-  PyTorch:
+  CPU-Tests:
+    # todo: to be replaced by TPU tests
     docker:
       - image: circleci/python:3.6
     environment:
       - TORCH_VERSION: "torch"
     steps: &steps
       - checkout
-      #- restore_cache:
-      #    keys:
-      #      # when lock file changes, use increasingly general patterns to restore cache
-      #      - pip-packages--{{ .Environment.CIRCLE_JOB }}
-      #      - pip-packages--
       - *install_deps
-      #- save_cache:
-      #    key: pip-packages--{{ .Environment.CIRCLE_JOB }}
-      #    paths:
-      #      # this path depends on where pipenv creates a virtualenv
-      #      - "~/.cache/pip"
-      #      - "/usr/local/lib/python3.6/site-packages"
-      #      - "/usr/local/lib/site-python"
       - *tests
       - store_test_results:
           path: test-reports
       - store_artifacts:
           path: test-reports
 
-  PyTorch-v1_1:
-    docker:
-      - image: circleci/python:3.6
-    environment:
-      - TORCH_VERSION: "torch>=1.1, <1.2"
-    steps: *steps
-
-  PyTorch-v1_2:
-    docker:
-      - image: circleci/python:3.6
-    environment:
-      - TORCH_VERSION: "torch>=1.2, <1.3"
-    steps: *steps
-
-  PyTorch-v1_3:
-    docker:
-      - image: circleci/python:3.6
-    environment:
-      - TORCH_VERSION: "torch>=1.3, <1.4"
-    steps: *steps
-
-  PyTorch-v1_4:
-    docker:
-      - image: circleci/python:3.6
-    environment:
-      - TORCH_VERSION: "torch>=1.4, <1.5"
-    steps: *steps
-
-  PyTorch-v1_5:
-    docker:
-      - image: circleci/python:3.6
-    environment:
-      - TORCH_VERSION: "torch>=1.5, <1.6"
-    steps: *steps
-
-  Examples:
-    docker:
-      - image: circleci/python:3.7
-    environment:
-        - TORCH_VERSION: "torch"
-    steps:
-      - checkout
-      - *install_deps
-      - *examples
-
-  Install-pkg:
-    docker:
-      - image: circleci/python:3.7
-    steps:
-      - checkout
-      - *create_pkg
-      - *install_pkg
-
-#orbs:
-#  python: circleci/python@0.2.1
-
 workflows:
   version: 2
   build:
     jobs:
-      - Formatting
       - Build-Docs
-      - PyTorch-v1_1
-      - PyTorch-v1_2
-      - PyTorch-v1_3
-      - PyTorch-v1_4
-      - PyTorch-v1_5
-      - Install-pkg
-      - Examples
+      - CPU-Tests

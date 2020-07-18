@@ -33,7 +33,7 @@ class UNet(nn.Module):
             feats *= 2
 
         for _ in range(num_layers - 1):
-            layers.append(Up(feats, feats // 2), bilinear)
+            layers.append(Up(feats, feats // 2, bilinear))
             feats //= 2
 
         layers.append(nn.Conv2d(feats, num_classes, kernel_size=1))
@@ -99,7 +99,10 @@ class Up(nn.Module):
         super().__init__()
         self.upsample = None
         if bilinear:
-            self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.upsample = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
+                nn.Conv2d(in_ch, in_ch // 2, kernel_size=1),
+            )
         else:
             self.upsample = nn.ConvTranspose2d(in_ch, in_ch // 2, kernel_size=2, stride=2)
 

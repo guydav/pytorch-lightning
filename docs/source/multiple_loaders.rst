@@ -1,3 +1,7 @@
+.. testsetup:: *
+
+    from pytorch_lightning.core.lightning import LightningModule
+
 Multiple Datasets
 =================
 Lightning supports multiple dataloaders in a few ways.
@@ -5,6 +9,8 @@ Lightning supports multiple dataloaders in a few ways.
 1. Create a dataloader that iterates both datasets under the hood.
 2. In the validation and test loop you also have the option to return multiple dataloaders
    which lightning will call sequentially.
+
+----------
 
 Multiple training dataloaders
 -----------------------------
@@ -14,7 +20,7 @@ dataloaders).
 
 (`reference <https://discuss.pytorch.org/t/train-simultaneously-on-two-datasets/649/2>`_)
 
-.. code-block:: python
+.. testcode::
 
     class ConcatDataset(torch.utils.data.Dataset):
         def __init__(self, *datasets):
@@ -27,6 +33,7 @@ dataloaders).
             return min(len(d) for d in self.datasets)
 
     class LitModel(LightningModule):
+
         def train_dataloader(self):
             concat_dataset = ConcatDataset(
                 datasets.ImageFolder(traindir_A),
@@ -44,9 +51,13 @@ dataloaders).
 
         def val_dataloader(self):
             # SAME
+            ...
 
         def test_dataloader(self):
             # SAME
+            ...
+
+----------
 
 Test/Val dataloaders
 --------------------
@@ -58,7 +69,7 @@ See the following for more details:
 - :meth:`~pytorch_lightning.core.LightningModule.val_dataloader`
 - :meth:`~pytorch_lightning.core.LightningModule.test_dataloader`
 
-.. code-block:: python
+.. testcode::
 
     def val_dataloader(self):
         loader_1 = Dataloader()

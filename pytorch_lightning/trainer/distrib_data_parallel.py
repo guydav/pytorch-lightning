@@ -116,13 +116,21 @@ When the script starts again, Lightning will:
 import os
 import re
 from abc import ABC, abstractmethod
-from typing import Union
+from typing import Union, List, Optional, Callable, Tuple
+import subprocess
+import sys
+from time import sleep
+import numpy as np
+from os.path import abspath
 
 import torch
 from pytorch_lightning import _logger as log
 from pytorch_lightning.loggers import LightningLoggerBase
+from pytorch_lightning.utilities import NATIVE_AMP_AVALAIBLE
 from pytorch_lightning.utilities.exceptions import MisconfigurationException
-from pytorch_lightning.utilities.warnings import set_proc_rank, rank_zero_warn
+from pytorch_lightning.utilities.distributed import rank_zero_only, rank_zero_warn, rank_zero_info
+from pytorch_lightning.core.lightning import LightningModule
+
 
 try:
     from apex import amp
@@ -133,10 +141,32 @@ else:
 
 try:
     import horovod.torch as hvd
-except ImportError:
+except (ModuleNotFoundError, ImportError):
     HOROVOD_AVAILABLE = False
 else:
     HOROVOD_AVAILABLE = True
+
+
+try:
+    from hydra.utils import to_absolute_path
+except ImportError:
+    HYDRA_AVAILABLE = False
+else:
+    HYDRA_AVAILABLE = True
+
+
+try:
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.xla_multiprocessing as xmp
+except ImportError:
+    XLA_AVAILABLE = False
+else:
+    XLA_AVAILABLE = True
+
+pid = os.getpid()
+rng1 = np.random.RandomState(pid)
+RANDOM_PORTS = rng1.randint(10000, 19999, 100)
 
 
 class TrainerDDPMixin(ABC):
@@ -145,12 +175,25 @@ class TrainerDDPMixin(ABC):
     #  the proper values/initialisation should be done in child class
     on_gpu: bool
     num_gpu_nodes: int
+    gpus: List[int]
     logger: Union[LightningLoggerBase, bool]
     data_parallel_device_ids: ...
-    distributed_backend: str
+    distributed_backend: Optional[str]
     amp_level: str
     use_tpu: bool
     default_root_dir: str
+    progress_bar_callback: ...
+    checkpoint_callback: ...
+    num_processes: int
+    num_nodes: int
+    node_rank: int
+    tpu_cores: int
+    testing: bool
+
+    @property
+    @abstractmethod
+    def is_global_zero(self) -> bool:
+        """Warning: this is just empty shell for code implemented in other class."""
 
     @property
     @abstractmethod
@@ -171,7 +214,27 @@ class TrainerDDPMixin(ABC):
         """Warning: this is just empty shell for code implemented in other class."""
 
     @abstractmethod
-    def init_optimizers(self, *args):
+    def init_optimizers(self, *args) -> Tuple[List, List, List]:
+        """Warning: this is just empty shell for code implemented in other class."""
+
+    @abstractmethod
+    def reinit_scheduler_properties(self, *args):
+        """Warning: this is just empty shell for code implemented in other class."""
+
+    @abstractmethod
+    def save_checkpoint(self, *args):
+        """Warning: this is just empty shell for code implemented in other class."""
+
+    @abstractmethod
+    def setup(self, *args) -> None:
+        """Warning: this is just empty shell for code implemented in other class."""
+
+    @abstractmethod
+    def get_model(self) -> LightningModule:
+        """Warning: this is just empty shell for code implemented in other class."""
+
+    @abstractmethod
+    def is_function_implemented(self, *args) -> bool:
         """Warning: this is just empty shell for code implemented in other class."""
 
     def init_tpu(self):
@@ -190,8 +253,7 @@ class TrainerDDPMixin(ABC):
 
         if distributed_backend is None:
             if self.has_horovodrun():
-                self.check_horovod()
-                self.use_horovod = True
+                self._set_horovod_backend()
             elif self.num_gpus == 0:
                 if self.num_nodes > 1 or self.num_processes > 1:
                     self.use_ddp = True  # ddp_cpu
@@ -200,16 +262,19 @@ class TrainerDDPMixin(ABC):
             elif self.num_gpus > 1:
                 rank_zero_warn('You requested multiple GPUs but did not specify a backend, e.g.'
                                ' Trainer(distributed_backend=dp) (or ddp, ddp2).'
-                               ' Setting distributed_backend=dp for you.')
-                self.use_dp = True
-        elif distributed_backend == "dp":
+                               ' Setting distributed_backend=ddp_spawn for you.')
+                self.distributed_backend = 'ddp_spawn'
+                distributed_backend = 'ddp_spawn'
+
+        if distributed_backend == "dp":
             # do nothing if num_gpus == 0
             if self.num_gpus == 1:
                 self.single_gpu = True
                 self.use_dp = True
             elif self.num_gpus > 1:
                 self.use_dp = True
-        elif distributed_backend == "ddp":
+
+        elif distributed_backend in ['ddp', 'ddp_spawn']:
             if self.num_gpus == 0:
                 if self.num_nodes > 1 or self.num_processes > 1:
                     self.use_ddp = True  # ddp_cpu
@@ -219,6 +284,7 @@ class TrainerDDPMixin(ABC):
             elif self.num_gpus > 1:
                 self.use_ddp = True
                 self.num_processes = self.num_gpus
+
         elif distributed_backend == "ddp2":
             # do nothing if num_gpus == 0
             if self.num_gpus >= 1:
@@ -231,8 +297,7 @@ class TrainerDDPMixin(ABC):
             self.data_parallel_device_ids = None
             self.on_gpu = False
         elif distributed_backend == 'horovod':
-            self.check_horovod()
-            self.use_horovod = True
+            self._set_horovod_backend()
 
         # throw error to force user ddp or ddp2 choice
         if self.num_nodes > 1 and not (self.use_ddp2 or self.use_ddp):
@@ -241,7 +306,9 @@ class TrainerDDPMixin(ABC):
                 'To silence this warning set distributed_backend=ddp or distributed_backend=ddp2'
             )
 
-        log.info(f'GPU available: {torch.cuda.is_available()}, used: {self.on_gpu}')
+        rank_zero_info(f'GPU available: {torch.cuda.is_available()}, used: {self.on_gpu}')
+        num_cores = self.tpu_cores if self.tpu_cores is not None else 0
+        rank_zero_info(f'TPU available: {XLA_AVAILABLE}, using: {num_cores} TPU cores')
 
     def configure_slurm_ddp(self, num_gpu_nodes):
         self.is_slurm_managing_tasks = False
@@ -270,8 +337,37 @@ class TrainerDDPMixin(ABC):
             should_fake = int(os.environ['FAKE_SLURM_MANAGING_TASKS'])
             if should_fake:
                 self.is_slurm_managing_tasks = True
-        except Exception as e:
+        except Exception:
             pass
+
+        # notify user the that slurm is managing tasks
+        if self.is_slurm_managing_tasks:
+            rank_zero_info('Multi-processing is handled by Slurm.')
+
+    def determine_local_rank(self):
+        if self.is_slurm_managing_tasks:
+            return int(os.environ['SLURM_LOCALID'])
+
+        else:
+            return int(os.environ.get('LOCAL_RANK', 0))
+
+    def determine_ddp_node_rank(self):
+        if self.is_slurm_managing_tasks:
+            return int(os.environ['SLURM_NODEID'])
+
+        # torchelastic uses the envvar GROUP_RANK, whereas other systems(?) use NODE_RANK.
+        # otherwise use given node rank or default to node rank 0
+        env_vars = ['NODE_RANK', 'GROUP_RANK']
+        node_ids = [(k, os.environ.get(k, None)) for k in env_vars]
+        node_ids = [(k, v) for k, v in node_ids if v is not None]
+        if len(node_ids) == 0:
+            return 0
+        if len(node_ids) > 1:
+            log.warning(f"Multiple environment variables ({node_ids}) defined for node rank. "
+                        f"Using the first one.")
+        k, rank = node_ids.pop()
+        rank_zero_info(f"Using environment variable {k} for node rank ({rank}).")
+        return int(rank)
 
     def set_nvidia_flags(self, is_slurm_managing_tasks, data_parallel_device_ids):
         if data_parallel_device_ids is None:
@@ -281,7 +377,7 @@ class TrainerDDPMixin(ABC):
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
         # when slurm is managing the task it sets the visible devices
-        if not is_slurm_managing_tasks:
+        if not is_slurm_managing_tasks and 'CUDA_VISIBLE_DEVICES' not in os.environ:
             if isinstance(data_parallel_device_ids, int):
                 id_str = ','.join(str(x) for x in list(range(data_parallel_device_ids)))
                 os.environ["CUDA_VISIBLE_DEVICES"] = id_str
@@ -289,50 +385,137 @@ class TrainerDDPMixin(ABC):
                 gpu_str = ','.join([str(x) for x in data_parallel_device_ids])
                 os.environ["CUDA_VISIBLE_DEVICES"] = gpu_str
 
-        log.info(f'VISIBLE GPUS: {os.environ["CUDA_VISIBLE_DEVICES"]}')
+        # don't make this debug... this is good UX
+        rank_zero_info(f'CUDA_VISIBLE_DEVICES: [{os.environ["CUDA_VISIBLE_DEVICES"]}]')
 
-    def ddp_train(self, process_idx, model):
+    def set_random_port(self, force=False):
         """
-        Entry point into a DP thread
-        :param gpu_idx:
-        :param model:
-        :param cluster_obj:
-        :return:
+        When running DDP NOT managed by SLURM, the ports might collide
         """
-        # node rank using relative slurm id if under slurm management
-        # otherwise use given node rank or default to node rank 0
+        # pick a random port first
+        assert self.num_nodes == 1, 'random port can only be called from single node training'
+        global RANDOM_PORTS
+        default_port = RANDOM_PORTS[-1]
+        RANDOM_PORTS = RANDOM_PORTS[:-1]
+
+        # when not forced, use the user port
+        if not force:
+            default_port = os.environ.get('MASTER_PORT', default_port)
+
+        os.environ['MASTER_PORT'] = str(default_port)
+
+    def spawn_ddp_children(self, model):
+        port = os.environ['MASTER_PORT']
+
+        master_address = '127.0.0.1' if 'MASTER_ADDR' not in os.environ else os.environ['MASTER_ADDR']
+        os.environ['MASTER_PORT'] = f'{port}'
+        os.environ['MASTER_ADDR'] = f'{master_address}'
+
+        # allow the user to pass the node rank
+        node_rank = '0'
+        if 'NODE_RANK' in os.environ:
+            node_rank = os.environ['NODE_RANK']
+        if 'GROUP_RANK' in os.environ:
+            node_rank = os.environ['GROUP_RANK']
+
+        os.environ['NODE_RANK'] = node_rank
+        os.environ['LOCAL_RANK'] = '0'
+
+        # when user is using hydra find the absolute path
+        path_lib = abspath if not HYDRA_AVAILABLE else to_absolute_path
+
+        # pull out the commands used to run the script and resolve the abs file path
+        command = sys.argv
         try:
-            node_id = os.environ['SLURM_NODEID'] if self.is_slurm_managing_tasks else os.environ['NODE_RANK']
-            self.node_rank = int(node_id)
-        except KeyError:
-            log.warning("SLURM_NODEID or NODE_RANK environment variable is not defined. Set as 0.")
-            self.node_rank = 0
+            full_path = path_lib(command[0])
+        except Exception as e:
+            full_path = abspath(command[0])
+
+        command[0] = full_path
+        # use the same python interpreter and actually running
+        command = [sys.executable] + command
+
+        # since this script sets the visible devices we replace the gpus flag with a number
+        num_gpus = os.environ['CUDA_VISIBLE_DEVICES'].split(',').__len__()
+
+        if '--gpus' in command:
+            gpu_flag_idx = command.index('--gpus')
+            command[gpu_flag_idx + 1] = f'{num_gpus}'
+
+        os.environ['WORLD_SIZE'] = f'{num_gpus * self.num_nodes}'
+
+        self.interactive_ddp_procs = []
+        for local_rank in range(1, self.num_processes):
+            env_copy = os.environ.copy()
+            env_copy['LOCAL_RANK'] = f'{local_rank}'
+
+            # start process
+            proc = subprocess.Popen(command, env=env_copy)
+            self.interactive_ddp_procs.append(proc)
+
+            # starting all processes at once can cause issues
+            # with dataloaders delay between 1-10 seconds
+            delay = np.random.uniform(1, 5, 1)[0]
+            sleep(delay)
+
+        local_rank = 0
+        results = self.ddp_train(local_rank, q=None, model=model, is_master=True)
+        del os.environ['WORLD_SIZE']
+
+        return results
+
+    def ddp_train(self, process_idx, q, model, is_master=False, proc_offset=0):
+        """
+        Entry point for ddp
+
+        Args:
+            process_idx:
+            q:
+            model:
+            is_master:
+            proc_offset:
+
+        Returns:
+
+        """
+        # offset the process id if requested
+        process_idx = process_idx + proc_offset
 
         # show progressbar only on progress_rank 0
-        self.progress_bar_refresh_rate = (
-            self.progress_bar_refresh_rate if self.node_rank == 0 and process_idx == 0 else 0
-        )
+        if (self.node_rank != 0 or process_idx != 0) and self.progress_bar_callback is not None:
+            self.progress_bar_callback.disable()
 
         # determine which process we are and world size
         if self.use_ddp:
-            self.proc_rank = self.node_rank * self.num_processes + process_idx
+            self.local_rank = process_idx
+            self.global_rank = self.node_rank * self.num_processes + process_idx
             self.world_size = self.num_nodes * self.num_processes
 
         elif self.use_ddp2:
-            self.proc_rank = self.node_rank
+            self.local_rank = self.node_rank
+            self.global_rank = self.node_rank
             self.world_size = self.num_nodes
-        # set warning rank
-        set_proc_rank(self.proc_rank)
 
-        # let the exp know the rank to avoid overwriting logs
-        if self.logger is not None:
-            self.logger.rank = self.proc_rank
+        # set warning rank
+        rank_zero_only.rank = self.global_rank
 
         # set up server using proc 0's ip address
         # try to init for 20 times at max in case ports are taken
         # where to store ip_table
         model.trainer = self
-        model.init_ddp_connection(self.proc_rank, self.world_size, self.is_slurm_managing_tasks)
+        model.init_ddp_connection(self.global_rank, self.world_size, self.is_slurm_managing_tasks)
+
+        # call setup after the ddp process has connected
+        self.setup('fit')
+        if self.is_function_implemented('setup', model):
+            model.setup('fit')
+
+        # on world_size=0 let everyone know training is starting
+        if self.is_global_zero:
+            log.info('-' * 100)
+            log.info(f'distributed_backend={self.distributed_backend}')
+            log.info(f'All DDP processes registered. Starting ddp with {self.world_size} processes')
+            log.info('-' * 100)
 
         # CHOOSE OPTIMIZER
         # allow for lr schedulers as well
@@ -341,7 +524,13 @@ class TrainerDDPMixin(ABC):
         # MODEL
         # copy model to each gpu
         if self.on_gpu:
-            self.root_gpu = process_idx
+            gpu_idx = process_idx
+            if is_master:
+                # source of truth is cuda for gpu idx
+                gpus = os.environ['CUDA_VISIBLE_DEVICES'].split(',')
+                gpu_idx = int(gpus[self.local_rank])
+
+            self.root_gpu = gpu_idx
             torch.cuda.set_device(self.root_gpu)
             model.cuda(self.root_gpu)
 
@@ -350,13 +539,14 @@ class TrainerDDPMixin(ABC):
 
         # AMP
         # run through amp wrapper before going to distributed DP
-        if self.use_amp:
-            # An example
+        # TODO: remove with dropping NVIDIA AMP support
+        if self.use_amp and not NATIVE_AMP_AVALAIBLE:
             model, optimizers = model.configure_apex(amp, model, self.optimizers, self.amp_level)
             self.optimizers = optimizers
+            self.reinit_scheduler_properties(self.optimizers, self.lr_schedulers)
 
         # DDP2 uses all GPUs on the machine
-        if self.distributed_backend == 'ddp':
+        if self.distributed_backend == 'ddp' or self.distributed_backend == 'ddp_spawn':
             device_ids = [self.root_gpu]
         elif self.use_ddp2:
             device_ids = self.data_parallel_device_ids
@@ -367,10 +557,40 @@ class TrainerDDPMixin(ABC):
         model = model.configure_ddp(model, device_ids)
 
         # continue training routine
-        self.run_pretrain_routine(model)
+        results = self.run_pretrain_routine(model)
 
-        # when ddp ends, we save the model
-        self.save_spawn_weights(model)
+        # get original model
+        model = self.get_model()
+
+        # persist info in ddp_spawn
+        self.transfer_ddp_spawn_state_on_fit_end(model, q, results)
+
+        # clean up memory
+        torch.cuda.empty_cache()
+
+        if self.global_rank == 0 and self.distributed_backend not in ['ddp_spawn', 'ddp_cpu']:
+            return results
+
+    def transfer_ddp_spawn_state_on_fit_end(self, model, q, results):
+        if self.distributed_backend not in ['ddp_spawn', 'ddp_cpu', 'tpu']:
+            return
+
+        # track the best model path
+        best_model_path = None
+        if self.checkpoint_callback is not None:
+            best_model_path = self.checkpoint_callback.best_model_path
+
+        if self.global_rank == 0 and q is not None:
+            rank_zero_warn('cleaning up ddp environment...')
+            q.put(best_model_path)
+            q.put(results)
+
+            # save the last weights
+            last_path = None
+            if not self.testing and best_model_path is not None and len(best_model_path) > 0:
+                last_path = re.sub('.ckpt', '.tmp_end.ckpt', best_model_path)
+                torch.save(model.state_dict(), last_path)
+            q.put(last_path)
 
     def save_spawn_weights(self, model):
         """
@@ -378,9 +598,10 @@ class TrainerDDPMixin(ABC):
         :param model:
         :return:
         """
-        if self.proc_rank == 0:
+        if self.is_global_zero:
             path = os.path.join(self.default_root_dir, '__temp_weight_ddp_end.ckpt')
             self.save_checkpoint(path)
+            return path
 
     def load_spawn_weights(self, original_model):
         """
@@ -392,7 +613,7 @@ class TrainerDDPMixin(ABC):
 
         loaded_model = original_model
 
-        if self.proc_rank == 0:
+        if self.is_global_zero:
             # load weights saved in ddp
             path = os.path.join(self.default_root_dir, '__temp_weight_ddp_end.ckpt')
             loaded_model = original_model.__class__.load_from_checkpoint(path)
@@ -407,8 +628,8 @@ class TrainerDDPMixin(ABC):
 
     def resolve_root_node_address(self, root_node):
         if '[' in root_node:
-            name = root_node.split('[')[0]
-            number = root_node.split(',')[0]
+            name, numbers = root_node.split('[', maxsplit=1)
+            number = numbers.split(',', maxsplit=1)[0]
             if '-' in number:
                 number = number.split('-')[0]
 
@@ -416,6 +637,16 @@ class TrainerDDPMixin(ABC):
             root_node = name + number
 
         return root_node
+
+    def _set_horovod_backend(self):
+        self.check_horovod()
+        self.use_horovod = True
+
+        # Initialize Horovod to get rank / size info
+        hvd.init()
+        if self.on_gpu:
+            # Horovod assigns one local GPU per process
+            self.root_gpu = hvd.local_rank()
 
     def check_horovod(self):
         """Raises a `MisconfigurationException` if the Trainer is not configured correctly for Horovod."""

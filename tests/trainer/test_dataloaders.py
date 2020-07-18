@@ -1,126 +1,106 @@
 import platform
+from unittest.mock import patch
 
 import pytest
 import torch
+from packaging.version import parse
+from torch.utils.data.dataloader import DataLoader
+from torch.utils.data.dataset import IterableDataset, Subset
 
-import tests.base.utils as tutils
+import tests.base.develop_pipelines as tpipes
 from pytorch_lightning import Trainer
+from pytorch_lightning.trainer.data_loading import _has_iterable_dataset, _has_len
 from pytorch_lightning.utilities.exceptions import MisconfigurationException
-from tests.base import (
-    TestModelBase,
-    LightningTestModel,
-    LightEmptyTestStep,
-    LightValidationMultipleDataloadersMixin,
-    LightTestMultipleDataloadersMixin,
-    LightTestFitSingleTestDataloadersMixin,
-    LightTestFitMultipleTestDataloadersMixin,
-    LightValStepFitMultipleDataloadersMixin,
-    LightValStepFitSingleDataloaderMixin,
-    LightTrainDataloader,
-    LightInfTrainDataloader,
-    LightInfValDataloader,
-    LightInfTestDataloader,
-    LightZeroLenDataloader
-)
+from tests.base import EvalModelTemplate
 
 
-def test_dataloader_config_errors(tmpdir):
-    tutils.reset_seed()
+def test_fit_train_loader_only(tmpdir):
 
-    class CurrentTestModel(
-        LightTrainDataloader,
-        TestModelBase,
-    ):
-        pass
+    model = EvalModelTemplate()
+    train_dataloader = model.train_dataloader()
 
-    hparams = tutils.get_default_hparams()
-    model = CurrentTestModel(hparams)
+    model.train_dataloader = None
+    model.val_dataloader = None
+    model.test_dataloader = None
 
-    # percent check < 0
+    model.validation_step = None
+    model.validation_epoch_end = None
 
-    # logger file to get meta
-    trainer_options = dict(
+    model.test_step = None
+    model.test_epoch_end = None
+
+    trainer = Trainer(fast_dev_run=True, default_root_dir=tmpdir)
+    trainer.fit(model, train_dataloader=train_dataloader)
+
+
+def test_fit_val_loader_only(tmpdir):
+
+    model = EvalModelTemplate()
+    train_dataloader = model.train_dataloader()
+    val_dataloader = model.val_dataloader()
+
+    model.train_dataloader = None
+    model.val_dataloader = None
+    model.test_dataloader = None
+
+    model.test_step = None
+    model.test_epoch_end = None
+
+    trainer = Trainer(fast_dev_run=True, default_root_dir=tmpdir)
+    trainer.fit(model, train_dataloader=train_dataloader, val_dataloaders=val_dataloader)
+
+
+@pytest.mark.parametrize("dataloader_options", [
+    dict(val_check_interval=1.1),
+    dict(val_check_interval=10000),
+])
+def test_dataloader_config_errors_runtime(tmpdir, dataloader_options):
+
+    model = EvalModelTemplate()
+
+    trainer = Trainer(
         default_root_dir=tmpdir,
         max_epochs=1,
-        train_percent_check=-0.1,
+        **dataloader_options,
     )
 
-    # fit model
-    trainer = Trainer(**trainer_options)
-
     with pytest.raises(ValueError):
+        # fit model
         trainer.fit(model)
 
-    # percent check > 1
 
-    # logger file to get meta
-    trainer_options = dict(
-        default_root_dir=tmpdir,
-        max_epochs=1,
-        train_percent_check=1.1,
-    )
-
-    # fit model
-    trainer = Trainer(**trainer_options)
-
-    with pytest.raises(ValueError):
-        trainer.fit(model)
-
-    # int val_check_interval > num batches
-
-    # logger file to get meta
-    trainer_options = dict(
-        default_root_dir=tmpdir,
-        max_epochs=1,
-        val_check_interval=10000
-    )
-
-    # fit model
-    trainer = Trainer(**trainer_options)
-
-    with pytest.raises(ValueError):
-        trainer.fit(model)
-
-    # float val_check_interval > 1
-
-    # logger file to get meta
-    trainer_options = dict(
-        default_root_dir=tmpdir,
-        max_epochs=1,
-        val_check_interval=1.1
-    )
-
-    # fit model
-    trainer = Trainer(**trainer_options)
-
-    with pytest.raises(ValueError):
-        trainer.fit(model)
+@pytest.mark.parametrize("dataloader_options", [
+    dict(limit_train_batches=-0.1),
+    dict(limit_train_batches=1.2),
+    dict(limit_val_batches=-0.1),
+    dict(limit_val_batches=1.2),
+    dict(limit_test_batches=-0.1),
+    dict(limit_test_batches=1.2),
+])
+def test_dataloader_config_errors_init(tmpdir, dataloader_options):
+    with pytest.raises(MisconfigurationException):
+        Trainer(
+            default_root_dir=tmpdir,
+            max_epochs=1,
+            **dataloader_options,
+        )
 
 
 def test_multiple_val_dataloader(tmpdir):
     """Verify multiple val_dataloader."""
-    tutils.reset_seed()
 
-    class CurrentTestModel(
-        LightTrainDataloader,
-        LightValidationMultipleDataloadersMixin,
-        TestModelBase,
-    ):
-        pass
-
-    hparams = tutils.get_default_hparams()
-    model = CurrentTestModel(hparams)
-
-    # logger file to get meta
-    trainer_options = dict(
-        default_root_dir=tmpdir,
-        max_epochs=1,
-        val_percent_check=0.1,
-        train_percent_check=1.0,
-    )
+    model = EvalModelTemplate()
+    model.val_dataloader = model.val_dataloader__multiple
+    model.validation_step = model.validation_step__multiple_dataloaders
+    model.validation_epoch_end = model.validation_epoch_end__multiple_dataloaders
 
     # fit model
-    trainer = Trainer(**trainer_options)
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        max_epochs=1,
+        limit_val_batches=0.1,
+        limit_train_batches=1.0,
+    )
     result = trainer.fit(model)
 
     # verify training completed
@@ -132,70 +112,60 @@ def test_multiple_val_dataloader(tmpdir):
 
     # make sure predictions are good for each val set
     for dataloader in trainer.val_dataloaders:
-        tutils.run_prediction(dataloader, trainer.model)
+        tpipes.run_prediction(dataloader, trainer.model)
 
 
-def test_multiple_test_dataloader(tmpdir):
+@pytest.mark.parametrize('ckpt_path', [None, 'best', 'specific'])
+def test_multiple_test_dataloader(tmpdir, ckpt_path):
     """Verify multiple test_dataloader."""
-    tutils.reset_seed()
 
-    class CurrentTestModel(
-        LightTrainDataloader,
-        LightTestMultipleDataloadersMixin,
-        LightEmptyTestStep,
-        TestModelBase,
-    ):
-        pass
+    model_template = EvalModelTemplate()
 
-    hparams = tutils.get_default_hparams()
-    model = CurrentTestModel(hparams)
+    class MultipleTestDataloaderModel(EvalModelTemplate):
+        def test_dataloader(self):
+            return model_template.test_dataloader__multiple()
 
-    # logger file to get meta
-    trainer_options = dict(
-        default_root_dir=tmpdir,
-        max_epochs=1,
-        val_percent_check=0.1,
-        train_percent_check=0.2
-    )
+        def test_step(self, batch, batch_idx, *args, **kwargs):
+            return model_template.test_step__multiple_dataloaders(batch, batch_idx, *args, **kwargs)
+
+    model = MultipleTestDataloaderModel()
 
     # fit model
-    trainer = Trainer(**trainer_options)
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        max_epochs=1,
+        limit_val_batches=0.1,
+        limit_train_batches=0.2,
+    )
     trainer.fit(model)
-    trainer.test()
+    if ckpt_path == 'specific':
+        ckpt_path = trainer.checkpoint_callback.best_model_path
+    trainer.test(ckpt_path=ckpt_path)
 
-    # verify there are 2 val loaders
+    # verify there are 2 test loaders
     assert len(trainer.test_dataloaders) == 2, \
         'Multiple test_dataloaders not initiated properly'
 
     # make sure predictions are good for each test set
     for dataloader in trainer.test_dataloaders:
-        tutils.run_prediction(dataloader, trainer.model)
+        tpipes.run_prediction(dataloader, trainer.model)
 
     # run the test method
-    trainer.test()
+    trainer.test(ckpt_path=ckpt_path)
 
 
-def test_train_dataloaders_passed_to_fit(tmpdir):
+def test_train_dataloader_passed_to_fit(tmpdir):
     """Verify that train dataloader can be passed to fit """
-    tutils.reset_seed()
-
-    class CurrentTestModel(LightTrainDataloader, TestModelBase):
-        pass
-
-    hparams = tutils.get_default_hparams()
-
-    # logger file to get meta
-    trainer_options = dict(
-        default_root_dir=tmpdir,
-        max_epochs=1,
-        val_percent_check=0.1,
-        train_percent_check=0.2
-    )
 
     # only train passed to fit
-    model = CurrentTestModel(hparams)
-    trainer = Trainer(**trainer_options)
-    fit_options = dict(train_dataloader=model._dataloader(train=True))
+    model = EvalModelTemplate()
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        max_epochs=1,
+        limit_val_batches=0.1,
+        limit_train_batches=0.2,
+    )
+    fit_options = dict(train_dataloader=model.dataloader(train=True))
     result = trainer.fit(model, **fit_options)
 
     assert result == 1
@@ -203,30 +173,17 @@ def test_train_dataloaders_passed_to_fit(tmpdir):
 
 def test_train_val_dataloaders_passed_to_fit(tmpdir):
     """ Verify that train & val dataloader can be passed to fit """
-    tutils.reset_seed()
-
-    class CurrentTestModel(
-        LightTrainDataloader,
-        LightValStepFitSingleDataloaderMixin,
-        TestModelBase,
-    ):
-        pass
-
-    hparams = tutils.get_default_hparams()
-
-    # logger file to get meta
-    trainer_options = dict(
-        default_root_dir=tmpdir,
-        max_epochs=1,
-        val_percent_check=0.1,
-        train_percent_check=0.2
-    )
 
     # train, val passed to fit
-    model = CurrentTestModel(hparams)
-    trainer = Trainer(**trainer_options)
-    fit_options = dict(train_dataloader=model._dataloader(train=True),
-                       val_dataloaders=model._dataloader(train=False))
+    model = EvalModelTemplate()
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        max_epochs=1,
+        limit_val_batches=0.1,
+        limit_train_batches=0.2,
+    )
+    fit_options = dict(train_dataloader=model.dataloader(train=True),
+                       val_dataloaders=model.dataloader(train=False))
 
     result = trainer.fit(model, **fit_options)
     assert result == 1
@@ -234,38 +191,27 @@ def test_train_val_dataloaders_passed_to_fit(tmpdir):
         f'`val_dataloaders` not initiated properly, got {trainer.val_dataloaders}'
 
 
-def test_all_dataloaders_passed_to_fit(tmpdir):
-    """Verify train, val & test dataloader can be passed to fit """
-    tutils.reset_seed()
+@pytest.mark.parametrize('ckpt_path', [None, 'best', 'specific'])
+def test_all_dataloaders_passed_to_fit(tmpdir, ckpt_path):
+    """Verify train, val & test dataloader(s) can be passed to fit and test method"""
 
-    class CurrentTestModel(
-        LightTrainDataloader,
-        LightValStepFitSingleDataloaderMixin,
-        LightTestFitSingleTestDataloadersMixin,
-        LightEmptyTestStep,
-        TestModelBase,
-    ):
-        pass
-
-    hparams = tutils.get_default_hparams()
-
-    # logger file to get meta
-    trainer_options = dict(
-        default_root_dir=tmpdir,
-        max_epochs=1,
-        val_percent_check=0.1,
-        train_percent_check=0.2
-    )
+    model = EvalModelTemplate()
 
     # train, val and test passed to fit
-    model = CurrentTestModel(hparams)
-    trainer = Trainer(**trainer_options)
-    fit_options = dict(train_dataloader=model._dataloader(train=True),
-                       val_dataloaders=model._dataloader(train=False))
-    test_options = dict(test_dataloaders=model._dataloader(train=False))
-
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        max_epochs=1,
+        limit_val_batches=0.1,
+        limit_train_batches=0.2,
+    )
+    fit_options = dict(train_dataloader=model.dataloader(train=True),
+                       val_dataloaders=model.dataloader(train=False))
     result = trainer.fit(model, **fit_options)
 
+    if ckpt_path == 'specific':
+        ckpt_path = trainer.checkpoint_callback.best_model_path
+    test_options = dict(test_dataloaders=model.dataloader(train=False),
+                        ckpt_path=ckpt_path)
     trainer.test(**test_options)
 
     assert result == 1
@@ -275,37 +221,31 @@ def test_all_dataloaders_passed_to_fit(tmpdir):
         f'test_dataloaders` not initiated properly, got {trainer.test_dataloaders}'
 
 
-def test_multiple_dataloaders_passed_to_fit(tmpdir):
+@pytest.mark.parametrize('ckpt_path', [None, 'best', 'specific'])
+def test_multiple_dataloaders_passed_to_fit(tmpdir, ckpt_path):
     """Verify that multiple val & test dataloaders can be passed to fit."""
-    tutils.reset_seed()
 
-    class CurrentTestModel(
-        LightningTestModel,
-        LightValStepFitMultipleDataloadersMixin,
-        LightTestFitMultipleTestDataloadersMixin,
-    ):
-        pass
-
-    hparams = tutils.get_default_hparams()
-
-    # logger file to get meta
-    trainer_options = dict(
-        default_root_dir=tmpdir,
-        max_epochs=1,
-        val_percent_check=0.1,
-        train_percent_check=0.2
-    )
+    model = EvalModelTemplate()
+    model.validation_step = model.validation_step__multiple_dataloaders
+    model.validation_epoch_end = model.validation_epoch_end__multiple_dataloaders
+    model.test_step = model.test_step__multiple_dataloaders
 
     # train, multiple val and multiple test passed to fit
-    model = CurrentTestModel(hparams)
-    trainer = Trainer(**trainer_options)
-    fit_options = dict(train_dataloader=model._dataloader(train=True),
-                       val_dataloaders=[model._dataloader(train=False),
-                                        model._dataloader(train=False)])
-    test_options = dict(test_dataloaders=[model._dataloader(train=False),
-                                          model._dataloader(train=False)])
-
-    results = trainer.fit(model, **fit_options)
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        max_epochs=1,
+        limit_val_batches=0.1,
+        limit_train_batches=0.2
+    )
+    fit_options = dict(train_dataloader=model.dataloader(train=True),
+                       val_dataloaders=[model.dataloader(train=False),
+                                        model.dataloader(train=False)])
+    trainer.fit(model, **fit_options)
+    if ckpt_path == 'specific':
+        ckpt_path = trainer.checkpoint_callback.best_model_path
+    test_options = dict(test_dataloaders=[model.dataloader(train=False),
+                                          model.dataloader(train=False)],
+                        ckpt_path=ckpt_path)
     trainer.test(**test_options)
 
     assert len(trainer.val_dataloaders) == 2, \
@@ -314,41 +254,110 @@ def test_multiple_dataloaders_passed_to_fit(tmpdir):
         f'Multiple `test_dataloaders` not initiated properly, got {trainer.test_dataloaders}'
 
 
-def test_mixing_of_dataloader_options(tmpdir):
+@pytest.mark.parametrize(
+    ['limit_train_batches', 'limit_val_batches', 'limit_test_batches'],
+    [
+        pytest.param(0.0, 0.0, 0.0),
+        pytest.param(0, 0, 0.5),
+        pytest.param(1.0, 1.0, 1.0),
+        pytest.param(0.2, 0.4, 0.4),
+    ]
+)
+def test_dataloaders_with_limit_percent_batches(tmpdir, limit_train_batches, limit_val_batches, limit_test_batches):
+    """Verify num_batches for val & test dataloaders passed with batch limit in percent"""
+    model = EvalModelTemplate()
+    model.val_dataloader = model.val_dataloader__multiple_mixed_length
+    model.test_dataloader = model.test_dataloader__multiple_mixed_length
+    model.validation_step = model.validation_step__multiple_dataloaders
+    model.validation_epoch_end = model.validation_epoch_end__multiple_dataloaders
+    model.test_step = model.test_step__multiple_dataloaders
+    model.test_epoch_end = model.test_epoch_end__multiple_dataloaders
+
+    # train, multiple val and multiple test passed with percent_check
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        max_epochs=1,
+        limit_train_batches=limit_train_batches,
+        limit_val_batches=limit_val_batches,
+        limit_test_batches=limit_test_batches,
+    )
+    trainer.fit(model)
+    expected_train_batches = int(len(trainer.train_dataloader) * limit_train_batches)
+    expected_val_batches = [
+        int(len(dataloader) * limit_val_batches) for dataloader in trainer.val_dataloaders
+    ]
+    assert trainer.num_training_batches == expected_train_batches
+    assert trainer.num_val_batches == expected_val_batches
+
+    trainer.test(ckpt_path=None)
+    expected_test_batches = [
+        int(len(dataloader) * limit_test_batches) for dataloader in trainer.test_dataloaders
+    ]
+    assert trainer.num_test_batches == expected_test_batches
+
+@pytest.mark.parametrize(
+    ['limit_train_batches', 'limit_val_batches', 'limit_test_batches'],
+    [
+        pytest.param(0, 0, 0),
+        pytest.param(1, 2, 3),
+        pytest.param(1, 2, 1e50),
+    ]
+)
+def test_dataloaders_with_limit_num_batches(tmpdir, limit_train_batches, limit_val_batches, limit_test_batches):
+    """Verify num_batches for val & test dataloaders passed with batch limit as number"""
+    model = EvalModelTemplate()
+    model.val_dataloader = model.val_dataloader__multiple_mixed_length
+    model.test_dataloader = model.test_dataloader__multiple_mixed_length
+    model.validation_step = model.validation_step__multiple_dataloaders
+    model.validation_epoch_end = model.validation_epoch_end__multiple_dataloaders
+    model.test_step = model.test_step__multiple_dataloaders
+    model.test_epoch_end = model.test_epoch_end__multiple_dataloaders
+
+    # train, multiple val and multiple test passed with percent_check
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        max_epochs=1,
+        limit_train_batches=limit_train_batches,
+        limit_val_batches=limit_val_batches,
+        limit_test_batches=limit_test_batches,
+    )
+    trainer.fit(model)
+    assert trainer.num_training_batches == limit_train_batches
+    assert trainer.num_val_batches == [limit_val_batches] * len(trainer.val_dataloaders)
+    trainer.test(ckpt_path=None)
+
+    # when the limit is greater than the number of test batches it should be the num in loaders
+    if limit_test_batches > 1e10:
+        assert trainer.num_test_batches == [len(x) for x in model.test_dataloader()]
+    else:
+        assert trainer.num_test_batches == [limit_test_batches] * len(trainer.test_dataloaders)
+
+
+@pytest.mark.parametrize('ckpt_path', [None, 'best', 'specific'])
+def test_mixing_of_dataloader_options(tmpdir, ckpt_path):
     """Verify that dataloaders can be passed to fit"""
-    tutils.reset_seed()
 
-    class CurrentTestModel(
-        LightTrainDataloader,
-        LightValStepFitSingleDataloaderMixin,
-        LightTestFitSingleTestDataloadersMixin,
-        TestModelBase,
-    ):
-        pass
+    model = EvalModelTemplate()
 
-    hparams = tutils.get_default_hparams()
-    model = CurrentTestModel(hparams)
-
-    # logger file to get meta
     trainer_options = dict(
         default_root_dir=tmpdir,
         max_epochs=1,
-        val_percent_check=0.1,
-        train_percent_check=0.2
+        limit_val_batches=0.1,
+        limit_train_batches=0.2
     )
 
     # fit model
     trainer = Trainer(**trainer_options)
-    fit_options = dict(val_dataloaders=model._dataloader(train=False))
-    results = trainer.fit(model, **fit_options)
+    results = trainer.fit(model, val_dataloaders=model.dataloader(train=False))
+    assert results
 
     # fit model
     trainer = Trainer(**trainer_options)
-    fit_options = dict(val_dataloaders=model._dataloader(train=False))
-    test_options = dict(test_dataloaders=model._dataloader(train=False))
-
-    _ = trainer.fit(model, **fit_options)
-    trainer.test(**test_options)
+    results = trainer.fit(model, val_dataloaders=model.dataloader(train=False))
+    assert results
+    if ckpt_path == 'specific':
+        ckpt_path = trainer.checkpoint_callback.best_model_path
+    trainer.test(test_dataloaders=model.dataloader(train=False), ckpt_path=ckpt_path)
 
     assert len(trainer.val_dataloaders) == 1, \
         f'`val_dataloaders` not initiated properly, got {trainer.val_dataloaders}'
@@ -356,111 +365,70 @@ def test_mixing_of_dataloader_options(tmpdir):
         f'`test_dataloaders` not initiated properly, got {trainer.test_dataloaders}'
 
 
-def test_inf_train_dataloader(tmpdir):
+def test_train_inf_dataloader_error(tmpdir):
     """Test inf train data loader (e.g. IterableDataset)"""
-    tutils.reset_seed()
+    model = EvalModelTemplate()
+    model.train_dataloader = model.train_dataloader__infinite
 
-    class CurrentTestModel(
-        LightInfTrainDataloader,
-        LightningTestModel
-    ):
-        pass
+    trainer = Trainer(default_root_dir=tmpdir, max_epochs=1, val_check_interval=0.5)
 
-    hparams = tutils.get_default_hparams()
-    model = CurrentTestModel(hparams)
-
-    # fit model
-    with pytest.raises(MisconfigurationException):
-        trainer = Trainer(
-            default_root_dir=tmpdir,
-            max_epochs=1,
-            val_check_interval=0.5
-        )
+    with pytest.raises(MisconfigurationException, match='infinite DataLoader'):
         trainer.fit(model)
+
+
+def test_val_inf_dataloader_error(tmpdir):
+    """Test inf train data loader (e.g. IterableDataset)"""
+    model = EvalModelTemplate()
+    model.val_dataloader = model.val_dataloader__infinite
+
+    trainer = Trainer(default_root_dir=tmpdir, max_epochs=1, limit_val_batches=0.5)
+
+    with pytest.raises(MisconfigurationException, match='infinite DataLoader'):
+        trainer.fit(model)
+
+
+def test_test_inf_dataloader_error(tmpdir):
+    """Test inf train data loader (e.g. IterableDataset)"""
+    model = EvalModelTemplate()
+    model.test_dataloader = model.test_dataloader__infinite
+
+    trainer = Trainer(default_root_dir=tmpdir, max_epochs=1, limit_test_batches=0.5)
+
+    with pytest.raises(MisconfigurationException, match='infinite DataLoader'):
+        trainer.test(model)
+
+
+@pytest.mark.parametrize('check_interval', [50, 1.0])
+def test_inf_train_dataloader(tmpdir, check_interval):
+    """Test inf train data loader (e.g. IterableDataset)"""
+
+    model = EvalModelTemplate()
+    model.train_dataloader = model.train_dataloader__infinite
 
     trainer = Trainer(
         default_root_dir=tmpdir,
         max_epochs=1,
-        val_check_interval=50
+        val_check_interval=check_interval,
     )
     result = trainer.fit(model)
-
-    # verify training completed
-    assert result == 1
-
-    trainer = Trainer(
-        default_root_dir=tmpdir,
-        max_epochs=1
-    )
-    result = trainer.fit(model)
-
     # verify training completed
     assert result == 1
 
 
-def test_inf_val_dataloader(tmpdir):
+@pytest.mark.parametrize('check_interval', [1.0])
+def test_inf_val_dataloader(tmpdir, check_interval):
     """Test inf val data loader (e.g. IterableDataset)"""
-    tutils.reset_seed()
 
-    class CurrentTestModel(
-        LightInfValDataloader,
-        LightningTestModel
-    ):
-        pass
-
-    hparams = tutils.get_default_hparams()
-    model = CurrentTestModel(hparams)
-
-    # fit model
-    with pytest.raises(MisconfigurationException):
-        trainer = Trainer(
-            default_root_dir=tmpdir,
-            max_epochs=1,
-            val_percent_check=0.5
-        )
-        trainer.fit(model)
+    model = EvalModelTemplate()
+    model.val_dataloader = model.val_dataloader__infinite
 
     # logger file to get meta
     trainer = Trainer(
         default_root_dir=tmpdir,
-        max_epochs=1
+        max_epochs=1,
+        val_check_interval=check_interval,
     )
     result = trainer.fit(model)
-
-    # verify training completed
-    assert result == 1
-
-
-def test_inf_test_dataloader(tmpdir):
-    """Test inf test data loader (e.g. IterableDataset)"""
-    tutils.reset_seed()
-
-    class CurrentTestModel(
-        LightInfTestDataloader,
-        LightningTestModel,
-        LightTestFitSingleTestDataloadersMixin
-    ):
-        pass
-
-    hparams = tutils.get_default_hparams()
-    model = CurrentTestModel(hparams)
-
-    # fit model
-    with pytest.raises(MisconfigurationException):
-        trainer = Trainer(
-            default_root_dir=tmpdir,
-            max_epochs=1,
-            test_percent_check=0.5
-        )
-        trainer.test(model)
-
-    # logger file to get meta
-    trainer = Trainer(
-        default_root_dir=tmpdir,
-        max_epochs=1
-    )
-    result = trainer.fit(model)
-    trainer.test(model)
 
     # verify training completed
     assert result == 1
@@ -468,67 +436,99 @@ def test_inf_test_dataloader(tmpdir):
 
 def test_error_on_zero_len_dataloader(tmpdir):
     """ Test that error is raised if a zero-length dataloader is defined """
-    tutils.reset_seed()
 
-    class CurrentTestModel(
-        LightZeroLenDataloader,
-        LightningTestModel
-    ):
-        pass
-
-    hparams = tutils.get_default_hparams()
-    model = CurrentTestModel(hparams)
+    model = EvalModelTemplate()
+    model.train_dataloader = model.train_dataloader__zero_length
 
     # fit model
     with pytest.raises(ValueError):
         trainer = Trainer(
             default_root_dir=tmpdir,
             max_epochs=1,
-            test_percent_check=0.5
+            limit_train_batches=0.1,
+            limit_val_batches=0.1,
+            limit_test_batches=0.1,
         )
         trainer.fit(model)
 
 
 @pytest.mark.skipif(platform.system() == 'Windows', reason='Does not apply to Windows platform.')
-def test_warning_with_few_workers(tmpdir):
+@pytest.mark.parametrize('ckpt_path', [None, 'best', 'specific'])
+@patch('pytorch_lightning.trainer.data_loading.multiprocessing.cpu_count', return_value=4)
+def test_warning_with_few_workers(mock, tmpdir, ckpt_path):
     """ Test that error is raised if dataloader with only a few workers is used """
-    tutils.reset_seed()
 
-    class CurrentTestModel(
-        LightTrainDataloader,
-        LightValStepFitSingleDataloaderMixin,
-        LightTestFitSingleTestDataloadersMixin,
-        LightEmptyTestStep,
-        TestModelBase,
-    ):
-        pass
-
-    hparams = tutils.get_default_hparams()
-    model = CurrentTestModel(hparams)
+    model = EvalModelTemplate()
 
     # logger file to get meta
     trainer_options = dict(
         default_root_dir=tmpdir,
         max_epochs=1,
-        val_percent_check=0.1,
-        train_percent_check=0.2
+        limit_val_batches=0.1,
+        limit_train_batches=0.2
     )
 
-    fit_options = dict(train_dataloader=model._dataloader(train=True),
-                       val_dataloaders=model._dataloader(train=False))
-    test_options = dict(test_dataloaders=model._dataloader(train=False))
+    train_dl = model.dataloader(train=True)
+    train_dl.num_workers = 0
 
+    val_dl = model.dataloader(train=False)
+    val_dl.num_workers = 0
+
+    train_dl = model.dataloader(train=False)
+    train_dl.num_workers = 0
+
+    fit_options = dict(train_dataloader=train_dl,
+                       val_dataloaders=val_dl)
     trainer = Trainer(**trainer_options)
 
     # fit model
-    with pytest.warns(UserWarning, match='train'):
+    with pytest.warns(
+        UserWarning, match='The dataloader, train dataloader, does not have many workers which may be a bottleneck.'
+    ):
         trainer.fit(model, **fit_options)
 
-    with pytest.warns(UserWarning, match='val'):
+    with pytest.warns(
+        UserWarning, match='The dataloader, val dataloader 0, does not have many workers which may be a bottleneck.'
+    ):
         trainer.fit(model, **fit_options)
 
-    with pytest.warns(UserWarning, match='test'):
+    if ckpt_path == 'specific':
+        ckpt_path = trainer.checkpoint_callback.best_model_path
+    test_options = dict(test_dataloaders=train_dl, ckpt_path=ckpt_path)
+    with pytest.warns(
+        UserWarning, match='The dataloader, test dataloader 0, does not have many workers which may be a bottleneck.'
+    ):
         trainer.test(**test_options)
+
+
+@pytest.mark.xfail(
+    parse(torch.__version__) < parse("1.4.0"),
+    reason="IterableDataset with __len__ before 1.4 raises",
+)
+def test_warning_with_iterable_dataset_and_len(tmpdir):
+    """ Tests that a warning messages is shown when an IterableDataset defines `__len__`. """
+    model = EvalModelTemplate()
+    original_dataset = model.train_dataloader().dataset
+
+    class IterableWithLen(IterableDataset):
+
+        def __iter__(self):
+            return iter(original_dataset)
+
+        def __len__(self):
+            return len(original_dataset)
+
+    dataloader = DataLoader(IterableWithLen(), batch_size=16)
+    assert _has_len(dataloader)
+    assert _has_iterable_dataset(dataloader)
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        max_steps=3,
+    )
+    with pytest.warns(UserWarning, match='Your `IterableDataset` has `__len__` defined.'):
+        trainer.fit(model, train_dataloader=dataloader, val_dataloaders=[dataloader])
+    with pytest.warns(UserWarning, match='Your `IterableDataset` has `__len__` defined.'):
+        trainer.test(model, test_dataloaders=[dataloader])
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason='Test requires multiple GPUs')
@@ -538,7 +538,7 @@ def test_dataloader_reinit_for_subclass():
         def __init__(self, dataset, batch_size=1, shuffle=False, sampler=None,
                      batch_sampler=None, num_workers=0, collate_fn=None,
                      pin_memory=False, drop_last=False, timeout=0,
-                     worker_init_fn=None, dummy_kwarg=None):
+                     worker_init_fn=None, dummy_kwarg=None, **kwargs):
             super().__init__(dataset, batch_size, shuffle, sampler, batch_sampler,
                              num_workers, collate_fn, pin_memory, drop_last, timeout,
                              worker_init_fn)
@@ -548,7 +548,7 @@ def test_dataloader_reinit_for_subclass():
     trainer = Trainer(
         gpus=[0, 1],
         num_nodes=1,
-        distributed_backend='ddp',
+        distributed_backend='ddp_spawn',
     )
 
     class CustomDummyObj:
@@ -557,7 +557,145 @@ def test_dataloader_reinit_for_subclass():
     result = trainer.auto_add_sampler(CustomDummyObj(), train=True)
     assert isinstance(result, CustomDummyObj), "Wrongly reinstantiated data loader"
 
-    result = trainer.auto_add_sampler(CustomDataLoader(list(range(1000))), train=True)
+    dataset = list(range(1000))
+    result = trainer.auto_add_sampler(CustomDataLoader(dataset), train=True)
     assert isinstance(result, torch.utils.data.DataLoader)
     assert isinstance(result, CustomDataLoader)
     assert hasattr(result, 'dummy_kwarg')
+
+    # Shuffled DataLoader should also work
+    result = trainer.auto_add_sampler(CustomDataLoader(list(range(1000)), shuffle=True), train=True)
+    assert isinstance(result, torch.utils.data.DataLoader)
+    assert isinstance(result, CustomDataLoader)
+    assert hasattr(result, 'dummy_kwarg')
+
+    class CustomSampler(torch.utils.data.Sampler):
+        pass
+
+    # Should raise an error if existing sampler is being replaced
+    with pytest.raises(MisconfigurationException, match='DistributedSampler'):
+        trainer.auto_add_sampler(
+            CustomDataLoader(list(range(1000)), sampler=CustomSampler(list(range(1000)))), train=True)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 3, reason='Test requires multiple GPUs')
+def test_batch_size_smaller_than_num_gpus(tmpdir):
+    # we need at least 3 gpus for this test
+    num_gpus = 3
+    batch_size = 3
+
+    class CurrentTestModel(EvalModelTemplate):
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # batch norm doesn't work with batch size 1, we replace it
+            self.c_d1_bn = torch.nn.ReLU()
+
+        def training_step(self, *args, **kwargs):
+            output = super().training_step(*args, **kwargs)
+            loss = output['loss']
+            # we make sure to add some metrics to the output dict,
+            # this is essential for this test
+            output['progress_bar'] = {'train_loss': loss}
+            return output
+
+        def train_dataloader(self):
+            dataloader = super().train_dataloader()
+            # construct a dataset with a size that is not divisible by num_gpus
+            # therefore the last batch will have a size < num_gpus
+            size = num_gpus * batch_size + (num_gpus - 1)
+            dataset = Subset(dataloader.dataset, range(size))
+            dataloader = DataLoader(
+                dataset,
+                batch_size=self.batch_size,
+                drop_last=False,
+            )
+            return dataloader
+
+    hparams = EvalModelTemplate.get_default_hparams()
+    hparams['batch_size'] = batch_size
+    model = CurrentTestModel(**hparams)
+
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        max_epochs=1,
+        limit_train_batches=0.1,
+        limit_val_batches=0,
+        gpus=num_gpus,
+    )
+
+    # we expect the reduction for the metrics also to happen on the last batch
+    # where we will get fewer metrics than gpus
+    result = trainer.fit(model)
+    assert 1 == result
+
+
+@pytest.mark.parametrize('check_interval', [1.0])
+def test_val_dataloader_not_implemented_error(tmpdir, check_interval):
+    """Test not_implemented_error data loader (e.g. IterableDataset)"""
+
+    model = EvalModelTemplate()
+    model.val_dataloader = model.val_dataloader__not_implemented_error
+
+    # logger file to get meta
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        max_steps=5,
+        max_epochs=1,
+        val_check_interval=check_interval,
+    )
+    result = trainer.fit(model)
+    # verify training completed
+    assert result == 1
+
+
+@pytest.mark.parametrize('check_interval', [50, 1.0])
+def test_train_dataloader_not_implemented_error(tmpdir, check_interval):
+    """Test not_implemented_error train data loader (e.g. IterableDataset)"""
+
+    model = EvalModelTemplate()
+    model.train_dataloader = model.train_dataloader__not_implemented_error
+    model.val_dataloader = model.val_dataloader__not_implemented_error
+
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        max_steps=5,
+        max_epochs=1,
+        val_check_interval=check_interval
+    )
+    result = trainer.fit(model)
+    # verify training completed
+    assert result == 1
+
+
+def test_train_dataloader_not_implemented_error_failed(tmpdir):
+    """Test not_implemented_error train data loader (e.g. IterableDataset)"""
+    model = EvalModelTemplate()
+    model.train_dataloader = model.train_dataloader__not_implemented_error
+
+    trainer = Trainer(default_root_dir=tmpdir, max_steps=5, max_epochs=1, val_check_interval=0.5)
+
+    with pytest.raises(MisconfigurationException, match='infinite DataLoader'):
+        trainer.fit(model)
+
+
+def test_val_dataloader_not_implemented_error_failed(tmpdir):
+    """Test not_implemented_error train data loader (e.g. IterableDataset)"""
+    model = EvalModelTemplate()
+    model.val_dataloader = model.val_dataloader__not_implemented_error
+
+    trainer = Trainer(default_root_dir=tmpdir, max_steps=5, max_epochs=1, limit_val_batches=0.5)
+
+    with pytest.raises(MisconfigurationException, match='infinite DataLoader'):
+        trainer.fit(model)
+
+
+def test_test_dataloader_not_implemented_error_failed(tmpdir):
+    """Test not_implemented_error train data loader (e.g. IterableDataset)"""
+    model = EvalModelTemplate()
+    model.test_dataloader = model.test_dataloader__not_implemented_error
+
+    trainer = Trainer(default_root_dir=tmpdir, max_steps=5, max_epochs=1, limit_test_batches=0.5)
+
+    with pytest.raises(MisconfigurationException, match='infinite DataLoader'):
+        trainer.test(model)

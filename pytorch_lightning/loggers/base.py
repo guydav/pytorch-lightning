@@ -4,25 +4,12 @@ import operator
 from abc import ABC, abstractmethod
 from argparse import Namespace
 from functools import wraps
-from typing import Union, Optional, Dict, Iterable, Any, Callable, List, Sequence, Mapping, Tuple
+from typing import Union, Optional, Dict, Iterable, Any, Callable, List, Sequence, Mapping, Tuple, MutableMapping
 
 import numpy as np
 import torch
 
-
-def rank_zero_only(fn: Callable):
-    """Decorate a logger method to run it only on the process with rank 0.
-
-    Args:
-        fn: Function to decorate
-    """
-
-    @wraps(fn)
-    def wrapped_fn(self, *args, **kwargs):
-        if self.rank == 0:
-            fn(self, *args, **kwargs)
-
-    return wrapped_fn
+from pytorch_lightning.utilities import rank_zero_only
 
 
 class LightningLoggerBase(ABC):
@@ -48,7 +35,6 @@ class LightningLoggerBase(ABC):
             agg_key_funcs: Optional[Mapping[str, Callable[[Sequence[float]], float]]] = None,
             agg_default_func: Callable[[Sequence[float]], float] = np.mean
     ):
-        self._rank = 0
         self._prev_step: int = -1
         self._metrics_to_agg: List[Dict[str, float]] = []
         self._agg_key_funcs = agg_key_funcs if agg_key_funcs else {}
@@ -139,7 +125,7 @@ class LightningLoggerBase(ABC):
         """
         agg_step, metrics_to_log = self._aggregate_metrics(metrics=metrics, step=step)
 
-        if metrics_to_log is not None:
+        if metrics_to_log:
             self.log_metrics(metrics=metrics_to_log, step=agg_step)
 
     @abstractmethod
@@ -188,9 +174,9 @@ class LightningLoggerBase(ABC):
 
         def _dict_generator(input_dict, prefixes=None):
             prefixes = prefixes[:] if prefixes else []
-            if isinstance(input_dict, dict):
+            if isinstance(input_dict, MutableMapping):
                 for key, value in input_dict.items():
-                    if isinstance(value, (dict, Namespace)):
+                    if isinstance(value, (MutableMapping, Namespace)):
                         value = vars(value) if isinstance(value, Namespace) else value
                         for d in _dict_generator(value, prefixes + [key]):
                             yield d
@@ -252,14 +238,12 @@ class LightningLoggerBase(ABC):
         self.save()
 
     @property
-    def rank(self) -> int:
-        """Process rank. In general, metrics should only be logged by the process with rank 0."""
-        return self._rank
-
-    @rank.setter
-    def rank(self, value: int) -> None:
-        """Set the process rank."""
-        self._rank = value
+    def save_dir(self) -> Optional[str]:
+        """
+        Return the root directory where experiment logs get saved, or `None` if the logger does not
+        save data locally.
+        """
+        return None
 
     @property
     @abstractmethod
@@ -280,6 +264,7 @@ class LoggerCollection(LightningLoggerBase):
     Args:
         logger_iterable: An iterable collection of loggers
     """
+
     def __init__(self, logger_iterable: Iterable[LightningLoggerBase]):
         super().__init__()
         self._logger_iterable = logger_iterable
@@ -306,11 +291,6 @@ class LoggerCollection(LightningLoggerBase):
     def close(self) -> None:
         [logger.close() for logger in self._logger_iterable]
 
-    @LightningLoggerBase.rank.setter
-    def rank(self, value: int) -> None:
-        for logger in self._logger_iterable:
-            logger.rank = value
-
     @property
     def name(self) -> str:
         return '_'.join([str(logger.name) for logger in self._logger_iterable])
@@ -318,6 +298,41 @@ class LoggerCollection(LightningLoggerBase):
     @property
     def version(self) -> str:
         return '_'.join([str(logger.version) for logger in self._logger_iterable])
+
+
+class DummyExperiment(object):
+    """ Dummy experiment """
+    def nop(*args, **kw):
+        pass
+
+    def __getattr__(self, _):
+        return self.nop
+
+
+class DummyLogger(LightningLoggerBase):
+    """ Dummy logger for internal use. Is usefull if we want to disable users
+        logger for a feature, but still secure that users code can run """
+    def __init__(self):
+        super().__init__()
+        self._experiment = DummyExperiment()
+
+    @property
+    def experiment(self):
+        return self._experiment
+
+    def log_metrics(self, metrics, step):
+        pass
+
+    def log_hyperparams(self, params):
+        pass
+
+    @property
+    def name(self):
+        pass
+
+    @property
+    def version(self):
+        pass
 
 
 def merge_dicts(
@@ -347,20 +362,39 @@ def merge_dicts(
 
     Examples:
         >>> import pprint
-        >>> d1 = {'a': 1.7, 'b': 2.0, 'c': 1}
-        >>> d2 = {'a': 1.1, 'b': 2.2, 'v': 1}
-        >>> d3 = {'a': 1.1, 'v': 2.3}
+        >>> d1 = {'a': 1.7, 'b': 2.0, 'c': 1, 'd': {'d1': 1, 'd3': 3}}
+        >>> d2 = {'a': 1.1, 'b': 2.2, 'v': 1, 'd': {'d1': 2, 'd2': 3}}
+        >>> d3 = {'a': 1.1, 'v': 2.3, 'd': {'d3': 3, 'd4': {'d5': 1}}}
         >>> dflt_func = min
-        >>> agg_funcs = {'a': np.mean, 'v': max}
+        >>> agg_funcs = {'a': np.mean, 'v': max, 'd': {'d1': sum}}
         >>> pprint.pprint(merge_dicts([d1, d2, d3], agg_funcs, dflt_func))
-        {'a': 1.3, 'b': 2.0, 'c': 1, 'v': 2.3}
+        {'a': 1.3,
+         'b': 2.0,
+         'c': 1,
+         'd': {'d1': 3, 'd2': 3, 'd3': 3, 'd4': {'d5': 1}},
+         'v': 2.3}
     """
-
+    agg_key_funcs = agg_key_funcs or dict()
     keys = list(functools.reduce(operator.or_, [set(d.keys()) for d in dicts]))
     d_out = {}
     for k in keys:
-        fn = agg_key_funcs.get(k, default_func) if agg_key_funcs else default_func
-        agg_val = fn([v for v in [d_in.get(k) for d_in in dicts] if v is not None])
-        d_out[k] = agg_val
+        fn = agg_key_funcs.get(k)
+        values_to_agg = [v for v in [d_in.get(k) for d_in in dicts] if v is not None]
+
+        if isinstance(values_to_agg[0], dict):
+            d_out[k] = merge_dicts(values_to_agg, fn, default_func)
+        else:
+            d_out[k] = (fn or default_func)(values_to_agg)
 
     return d_out
+
+
+def rank_zero_experiment(fn: Callable) -> Callable:
+    """ Returns the real experiment on rank 0 and otherwise the DummyExperiment. """
+    @wraps(fn)
+    def experiment(self):
+        @rank_zero_only
+        def get_experiment():
+            return fn(self)
+        return get_experiment() or DummyExperiment()
+    return experiment
